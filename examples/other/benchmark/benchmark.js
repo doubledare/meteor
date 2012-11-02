@@ -1,3 +1,9 @@
+//////////////////////////////
+// Parameters for the test
+//////////////////////////////
+
+// XXX pick different scenarios, have configurable?
+
 var PARAMS = {
   numBuckets: 10,
   numCollections: 1,
@@ -20,26 +26,38 @@ var PARAMS = {
   // size. In seconds. falsy to disable.
   maxAge: 60,
 
+  // XXX also max documents?
+  // count and remove N?
+
   // Document size.
   // XXX make this a random distribution?
   //
   // bytes of randomness per document.
-  documentSize: 2048,
+  documentSize: 1024,
   // how many fields of randomness per document.
-  documentNumFields: 16
+  documentNumFields: 8
 };
 
-// XXX pick different scenarios
 
-var Collections = [];
-_.times(PARAMS.numCollections, function (n) {
-  Collections.push(new Meteor.Collection("Collection" + n));
-});
 
+//////////////////////////////
+// Helper Functions
+//////////////////////////////
 
 var random = function (n) {
   return (Math.floor(Math.random() * n));
-}
+};
+
+var randomChars =
+      'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'.split('');
+var randomString = function (length) {
+  // XXX make more efficient
+  var ret = '';
+  _.times(length, function () {
+    ret += randomChars[random(randomChars.length)];
+  });
+  return ret;
+};
 
 var pickCollection = function () {
   return Collections[random(Collections.length)];
@@ -47,19 +65,26 @@ var pickCollection = function () {
 
 var generateDoc = function () {
   var ret = {};
-  ret.bucket = random(PARAMS.numBuckets); // XXX!
+  ret.bucket = random(PARAMS.numBuckets);
   // XXX trusting client clock is wrong!!
   ret.when = +(new Date);
-
   _.times(PARAMS.documentNumFields, function (n) {
-    // XXX
-    ret[n] = "XXX random string of length: " +
-      (PARAMS.documentSize/PARAMS.documentNumFields);
+    ret['Field' + n] = randomString(PARAMS.documentSize/PARAMS.documentNumFields);
   });
 
   return ret;
 };
 
+
+//////////////////////////////
+// Data
+//////////////////////////////
+
+
+var Collections = [];
+_.times(PARAMS.numCollections, function (n) {
+  Collections.push(new Meteor.Collection("Collection" + n));
+});
 
 
 if (Meteor.isServer) {
@@ -87,9 +112,6 @@ if (Meteor.isServer) {
 
   Meteor.publish("data", function (collection, bucket) {
     var C = Collections[collection];
-    if (!C)
-      console.log("XXX", collection);
-
     return C.find({bucket: bucket});
   });
 
@@ -128,15 +150,29 @@ if (Meteor.isClient) {
       // XXX optimize!!
       var doc = _.first(_.shuffle(C.find({}).fetch()));
       if (doc)
-        C.remove(doc.id);
+        C.remove(doc._id);
     }, 1000 / PARAMS.removeRate);
   }
 
   if (PARAMS.updateRate) {
     Meteor.setInterval(function () {
       var C = pickCollection();
-      // XXX update!!
+      // XXX optimize!!
+      var doc = _.first(_.shuffle(C.find({}).fetch()));
+      if (doc) {
+        var field = 'Field' + random(PARAMS.documentNumFields);
+        var modifer = {};
+        modifer[field] =
+          randomString(PARAMS.documentSize/PARAMS.documentNumFields);
+        C.update(doc._id, {$set: modifer});
+      }
     }, 1000 / PARAMS.updateRate);
   }
+
+
+  // XXX Count changes per second
+  // function to update stats
+  // find({}).observe on each collection with added/removed/changed func
+  // periodic timer to update stats
 
 }
