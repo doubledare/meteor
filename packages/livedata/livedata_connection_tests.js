@@ -42,21 +42,21 @@ Tinytest.add("livedata stub - receive data", function (test) {
   stream.receive({msg: 'data', collection: coll_name, id: '1234',
                   set: {a: 1}});
   // break throught the black box and test internal state
-  test.length(conn.queued[coll_name], 1);
+  test.length(conn._updatesForUnknownStores[coll_name], 1);
 
   // XXX: Test that the old signature of passing manager directly instead of in
   // options works.
   var coll = new Meteor.Collection(coll_name, conn);
 
   // queue has been emptied and doc is in db.
-  test.isUndefined(conn.queued[coll_name]);
+  test.isUndefined(conn._updatesForUnknownStores[coll_name]);
   test.equal(coll.find({}).fetch(), [{_id:'1234', a:1}]);
 
   // second message. applied directly to the db.
   stream.receive({msg: 'data', collection: coll_name, id: '1234',
                   set: {a:2}});
   test.equal(coll.find({}).fetch(), [{_id:'1234', a:2}]);
-  test.isUndefined(conn.queued[coll_name]);
+  test.isUndefined(conn._updatesForUnknownStores[coll_name]);
 });
 
 Tinytest.addAsync("livedata stub - subscribe", function (test, onComplete) {
@@ -183,15 +183,20 @@ Tinytest.add("livedata stub - methods", function (test) {
 
   test.equal(coll.find({}).count(), 1);
   test.equal(coll.find({value: 'friday!'}).count(), 1);
+  var docId = coll.findOne({value: 'friday!'})._id;
 
   // results result in callback
   stream.receive({msg: 'result', id:message.id, result:"1234"});
-  test.isTrue(callback_fired);
+  test.isTrue(callback_fired);  // XXX this test will change
+
+  // result callback doesn't affect data
+  test.equal(coll.find({}).count(), 1);
+  test.equal(coll.find({value: 'friday!'}).count(), 1);
+  test.equal(counts, {added: 1, removed: 0, changed: 0, moved: 0});
 
   // data methods do not show up (not quiescent yet)
-  stream.receive({msg: 'data', collection: coll_name, id: '1234',
+  stream.receive({msg: 'data', collection: coll_name, id: docId,
                   set: {value: 'tuesday'}});
-
   test.equal(coll.find({}).count(), 1);
   test.equal(coll.find({value: 'friday!'}).count(), 1);
   test.equal(counts, {added: 1, removed: 0, changed: 0, moved: 0});
@@ -208,32 +213,33 @@ Tinytest.add("livedata stub - methods", function (test) {
   test.equal(message_2, {msg: 'method', method: 'do_something_else',
                          params: ['monday'], id:message_2.id});
 
-  // get the first data satisfied message. changes are still not applied
-  // to database.
+  // get the first data satisfied message. changes are applied to database even
+  // though another method is outstand, because the other method didn't have a
+  // stub.
   stream.receive({msg: 'data', 'methods': [message.id]});
 
   test.equal(coll.find({}).count(), 1);
-  test.equal(coll.find({value: 'friday!'}).count(), 1);
-  test.equal(counts, {added: 1, removed: 0, changed: 0, moved: 0});
+  test.equal(coll.find({value: 'tuesday'}).count(), 1);
+  test.equal(counts, {added: 1, removed: 0, changed: 1, moved: 0});
 
   // second result
+  test.isFalse(callback_fired);
   stream.receive({msg: 'result', id:message_2.id, result:"bupkis"});
   test.isTrue(callback_fired);
 
-  // get second satisfied, now changes are applied.
+  // get second satisfied; no new changes are applied.
   stream.receive({msg: 'data', 'methods': [message_2.id]});
 
   test.equal(coll.find({}).count(), 1);
-  test.equal(coll.find({value: 'friday!'}).count(), 0);
-  test.equal(coll.find({value: 'tuesday', _id: '1234'}).count(), 1);
-  test.equal(counts, {added: 2, removed: 1, changed: 0, moved: 0});
+  test.equal(coll.find({value: 'tuesday', _id: docId}).count(), 1);
+  test.equal(counts, {added: 1, removed: 0, changed: 1, moved: 0});
 
   handle.stop();
 });
 
 
 // method calls another method in simulation. see not sent.
-Tinytest.add("livedata stub - sub methods", function (test) {
+Tinytest.add("livedata stub - methods calling methods", function (test) {
   var stream = new Meteor._StubStream();
   var conn = newConnection(stream);
 
@@ -273,19 +279,34 @@ Tinytest.add("livedata stub - sub methods", function (test) {
 
   // but inner method runs locally.
   test.equal(counts, {added: 1, removed: 0, changed: 0, moved: 0});
+  test.equal(coll.find().count(), 1);
+  var docId = coll.findOne()._id;
+  test.equal(coll.findOne(), {_id: docId, a: 1});
 
   // we get the results (this is important to make the test not block
   // auto-reload!)
   stream.receive({msg: 'result', id:message.id, result:"1234"});
 
-  // get data from the method. does not show up.
-  stream.receive({msg: 'data', collection: coll_name, id: '1234',
+  // get data from the method. data from this doc does not show up yet, but data
+  // from another doc does.
+  stream.receive({msg: 'data', collection: coll_name, id: docId,
                   set: {value: 'tuesday'}});
   test.equal(counts, {added: 1, removed: 0, changed: 0, moved: 0});
+  test.equal(coll.findOne(docId), {_id: docId, a: 1});
+  stream.receive({msg: 'data', collection: coll_name, id: 'monkey',
+                  set: {value: 'bla'}});
+  test.equal(counts, {added: 2, removed: 0, changed: 0, moved: 0});
+  test.equal(coll.findOne(docId), {_id: docId, a: 1});
+  var newDoc = coll.findOne({value: 'bla'});
+  test.isTrue(newDoc);
+  test.equal(newDoc, {_id: newDoc._id, value: 'bla'});
 
-  // get method satisfied. data shows up.
+  // get method satisfied. all data shows up. the 'a' field is reverted and
+  // 'value' field is set.
   stream.receive({msg: 'data', 'methods': [message.id]});
-  test.equal(counts, {added: 2, removed: 1, changed: 0, moved: 0});
+  test.equal(counts, {added: 2, removed: 0, changed: 1, moved: 0});
+  test.equal(coll.findOne(docId), {_id: docId, value: 'tuesday'});
+  test.equal(coll.findOne(newDoc._id), {_id: newDoc._id, value: 'bla'});
 
   handle.stop();
 });
@@ -364,12 +385,14 @@ Tinytest.add("livedata stub - reconnect", function (test) {
   var wait_method_message = JSON.parse(stream.sent.shift());
   test.equal(method_message, {msg: 'method', method: 'do_something',
                               params: [], id:method_message.id});
+  test.equal(wait_method_message, {msg: 'method', method: 'do_something',
+                                   params: [], id: wait_method_message.id});
 
-  // more data. doesn't show up.
+  // more data. shows up immediately because there was no relevant method stub.
   stream.receive({msg: 'data', collection: coll_name,
                   id: '1234', set: {c:3}});
-  test.equal(coll.find({c:3}).count(), 0);
-  test.equal(counts, {added: 1, removed: 0, changed: 1, moved: 0});
+  test.equal(coll.findOne('1234'), {_id: '1234', a: 1, b: 2, c: 3});
+  test.equal(counts, {added: 1, removed: 0, changed: 2, moved: 0});
 
   // stream reset. reconnect!
   // we send a connect, our pending messages, and our subs.
@@ -385,12 +408,12 @@ Tinytest.add("livedata stub - reconnect", function (test) {
 
   // resend data. doesn't show up.
   stream.receive({msg: 'data', collection: coll_name,
-                  id: '1234', set: {a:1, b:2, c:3}});
+                  id: '1234', set: {a:1, b:2, c:3, d: 4}});
   stream.receive({msg: 'data', collection: coll_name,
-                  id: '2345', set: {d:4}});
-
-  test.equal(coll.find({c:3}).count(), 0);
-  test.equal(counts, {added: 1, removed: 0, changed: 1, moved: 0});
+                  id: '2345', set: {e: 5}});
+  test.equal(coll.findOne('1234'), {_id: '1234', a: 1, b: 2, c: 3});
+  test.isFalse(coll.findOne('2345'));
+  test.equal(counts, {added: 1, removed: 0, changed: 2, moved: 0});
 
   // satisfy and return method callback
   stream.receive({msg: 'data',
@@ -402,16 +425,17 @@ Tinytest.add("livedata stub - reconnect", function (test) {
   test.isTrue(method_callback_fired);
 
   // still no update.
-  test.equal(coll.find({c:3}).count(), 0);
-  test.equal(counts, {added: 1, removed: 0, changed: 1, moved: 0});
+  test.equal(coll.findOne('1234'), {_id: '1234', a: 1, b: 2, c: 3});
+  test.isFalse(coll.findOne('2345'));
+  test.equal(counts, {added: 1, removed: 0, changed: 2, moved: 0});
 
   // re-satisfy sub
   stream.receive({msg: 'data', subs: [sub_message.id]});
 
   // now the doc changes
-  test.equal(coll.find({c:3}).count(), 1);
-  test.equal(counts, {added: 2, removed: 0, changed: 2, moved: 0});
-
+  test.equal(coll.findOne('1234'), {_id: '1234', a: 1, b: 2, c: 3, d: 4});
+  test.equal(coll.findOne('2345'), {_id: '2345', e: 5});
+  test.equal(counts, {added: 2, removed: 0, changed: 3, moved: 0});
 
   handle.stop();
 });

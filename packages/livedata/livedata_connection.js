@@ -1,3 +1,4 @@
+(function () {
 if (Meteor.isServer) {
   // XXX namespacing
   var Future = __meteor_bootstrap__.require(path.join('fibers', 'future'));
@@ -41,7 +42,8 @@ Meteor._LivedataConnection = function (url, options) {
   // --- Three classes of outstanding methods ---
 
   // 1. either already sent, or waiting to be sent with no special
-  // consideration once we reconnect
+  // consideration once we reconnect. Methods are removed when their
+  // result comes in (not when their data-end message comes in!)
   self.outstanding_methods = []; // each item has keys: msg, callback
 
   // 2. the sole outstanding method that needs to be waited on, or null
@@ -59,20 +61,36 @@ Meteor._LivedataConnection = function (url, options) {
   // the existing outstanding ones
   self.onReconnect = null;
   // waiting for data from method
+  // XXX Remove this when quiescence is per-object.
   self.unsatisfied_methods = {}; // map from method_id -> true
   // sub was ready, is no longer (due to reconnect)
   self.unready_subscriptions = {}; // map from sub._id -> true
-  // messages from the server that have not been applied
-  self.pending_data = []; // array of pending data messages
   // name -> updates for (yet to be created) collection
-  self.queued = {};
+  self._updatesForUnknownStores = {};
   // if we're blocking a migration, the retry func
   self._retryMigrate = null;
+
+  // XXX doc and better name
+  self._bufferedMessagesAtReconnect = null;
+  // XXX doc and better name
+  self._readySubs = [];
+
+  // method ID -> array of collection/id pairs, listing documents written by a
+  // given method's stub.
+  self._documentsWrittenByStub = {};
+  // collection -> id -> "server document" object. A "server document" has:
+  // - "document": the version of the document according the
+  //   server (ie, the snapshot before a stub wrote it, amended by any changes
+  //   received from the server)
+  // - "writtenByStubs": a set of method IDs whose stubs wrote to the document
+  //   whose "data done" messages have not yet been processed
+  self._serverDocuments = {};
 
   // metadata for subscriptions
   self.subs = new LocalCollection;
   // keyed by subs._id. value is unset or an array. if set, sub is not
   // yet ready.
+  // XXX rename
   self.sub_ready_callbacks = {};
 
   // Per-connection scratch area. This is only used internally, but we
@@ -195,22 +213,29 @@ Meteor._LivedataConnection = function (url, options) {
 
 _.extend(Meteor._LivedataConnection.prototype, {
   // 'name' is the name of the data on the wire that should go in the
-  // store. 'store' should be an object with methods beginUpdate,
-  // update, endUpdate, reset. see Collection for an example.
-  registerStore: function (name, store) {
+  // store. 'inStore' should be an object with methods beginUpdate, update,
+  // endUpdate, saveOriginals, retrieveOriginals. see Collection for an example.
+  registerStore: function (name, inStore) {
     var self = this;
 
     if (name in self.stores)
       return false;
+
+    var store = {};
+    _.each(['update', 'beginUpdate', 'endUpdate', 'saveOriginals',
+            'retrieveOriginals'], function (method) {
+              store[method] = inStore[method] || function () {};
+            });
+
     self.stores[name] = store;
 
-    var queued = self.queued[name] || [];
-    store.beginUpdate(queued.length);
+    var queued = self._updatesForUnknownStores[name] || [];
+    store.beginUpdate(queued.length, false);
     _.each(queued, function (msg) {
       store.update(msg);
     });
     store.endUpdate();
-    delete self.queued[name];
+    delete self._updatesForUnknownStores[name];
 
     return true;
   },
@@ -309,6 +334,16 @@ _.extend(Meteor._LivedataConnection.prototype, {
       });
     }
 
+    // Lazily allocate method ID once we know that it'll be needed.
+    var methodId = (function () {
+      var id;
+      return function () {
+        if (id === undefined)
+          id = '' + (self.next_method_id++);
+        return id;
+      };
+    })();
+
     if (Meteor.isClient) {
       // If on a client, run the stub, if we have one. The stub is
       // supposed to make some temporary writes to the database to
@@ -322,6 +357,9 @@ _.extend(Meteor._LivedataConnection.prototype, {
       // server. The exception is if the *caller* is a stub. In that
       // case, we're not going to do a RPC, so we use the return value
       // of the stub as our return value.
+      var enclosing = Meteor._CurrentInvocation.get();
+      var alreadyInSimulation = enclosing && enclosing.isSimulation;
+
       var stub = self.method_handlers[name];
       if (stub) {
         var setUserId = function(userId) {
@@ -332,6 +370,10 @@ _.extend(Meteor._LivedataConnection.prototype, {
           userId: self.userId(), setUserId: setUserId,
           sessionData: self.sessionData
         });
+
+        if (!alreadyInSimulation)
+          self._saveOriginals();
+
         try {
           var ret = Meteor._CurrentInvocation.withValue(invocation,function () {
             return stub.apply(invocation, args);
@@ -340,17 +382,18 @@ _.extend(Meteor._LivedataConnection.prototype, {
         catch (e) {
           var exception = e;
         }
+
+        if (!alreadyInSimulation)
+          self._retrieveAndStoreOriginals(methodId());
       }
 
       // If we're in a simulation, stop and return the result we have,
       // rather than going on to do an RPC. If there was no stub,
       // we'll end up returning undefined.
-      var enclosing = Meteor._CurrentInvocation.get();
-      var isSimulation = enclosing && enclosing.isSimulation;
-      if (isSimulation) {
+      if (alreadyInSimulation) {
         if (callback) {
           callback(exception, ret);
-          return;
+          return undefined;
         }
         if (exception)
           throw exception;
@@ -395,7 +438,7 @@ _.extend(Meteor._LivedataConnection.prototype, {
       msg: 'method',
       method: name,
       params: args,
-      id: '' + (self.next_method_id++)
+      id: methodId()
     };
 
     if (self.outstanding_wait_method) {
@@ -430,6 +473,42 @@ _.extend(Meteor._LivedataConnection.prototype, {
       if (outcome[0])
         throw outcome[0];
       return outcome[1];
+    }
+    return undefined;
+  },
+
+  _saveOriginals: function () {
+    var self = this;
+    _.each(self.stores, function (s) {
+      s.saveOriginals();
+    });
+  },
+  _retrieveAndStoreOriginals: function (methodId) {
+    var self = this;
+    if (self._documentsWrittenByStub[methodId])
+      throw new Error("Duplicate methodId in _retrieveAndStoreOriginals");
+
+    var docsWritten = [];
+    _.each(self.stores, function (s, collection) {
+      var originals = s.retrieveOriginals();
+      _.each(originals, function (doc, id) {
+        docsWritten.push({collection: collection, id: id});
+        var serverDoc = Meteor._ensure(self._serverDocuments, collection, id);
+        if (serverDoc.writtenByStubs) {
+          // We're not the first stub to write this doc. Just add our method ID
+          // to the record.
+          serverDoc.writtenByStubs[methodId] = true;
+        } else {
+          // First stub! Save the original value and our method ID.
+          serverDoc.document = doc;
+          serverDoc.flushCallbacks = [];
+          serverDoc.writtenByStubs = {};
+          serverDoc.writtenByStubs[methodId] = true;
+        }
+      });
+    });
+    if (!_.isEmpty(docsWritten)) {
+      self._documentsWrittenByStub[methodId] = docsWritten;
     }
   },
 
@@ -501,12 +580,12 @@ _.extend(Meteor._LivedataConnection.prototype, {
 
     // Server doesn't have our data any more. Re-sync a new session.
 
-    // Put a reset message into the pending data queue and discard any
-    // previous messages (they are unimportant now).
-    self.pending_data = ["reset"];
-    self.queued = {};
+    // XXX redoc
+    self._bufferedMessagesAtReconnect = null;
+    self._updatesForUnknownStores = {};
 
     // Mark all currently ready subscriptions as 'unready'.
+    // XXX maybe rename unready_subscriptions
     var all_subs = self.subs.find({}).fetch();
     self.unready_subscriptions = {};
     _.each(all_subs, function (sub) {
@@ -514,96 +593,180 @@ _.extend(Meteor._LivedataConnection.prototype, {
         self.unready_subscriptions[sub._id] = true;
     });
 
+    if (! _.isEmpty(self.unready_subscriptions))
+      self._bufferedMessagesAtReconnect = [];
+
     // Do not clear the database here. That happens once all the subs
-    // are re-ready and we process pending_data.
+    // are re-ready and we process _bufferedMessagesAtReconnect.
   },
 
   _livedata_data: function (msg) {
     var self = this;
 
-    // Add the data message to the queue
-    self.pending_data.push(msg);
+    var resetStores = false;
+    // collection name -> array of messages
+    var updates = {};
 
-    // Process satisfied methods and subscriptions.
-    // NOTE: does not fire callbacks here, that happens when
-    // the data message is processed for real. This is just for
-    // quiescing.
-    _.each(msg.methods || [], function (method_id) {
-      delete self.unsatisfied_methods[method_id];
-    });
-    _.each(msg.subs || [], function (sub_id) {
-      delete self.unready_subscriptions[sub_id];
-    });
-
-    // If there are still method invocations in flight, stop
-    for (var method_id in self.unsatisfied_methods)
-      return;
-    // If there are still uncomplete subscriptions, stop
-    for (var sub_id in self.unready_subscriptions)
-      return;
-
-    // We have quiesced. Blow away local changes and replace
-    // with authoritative changes from server.
-
-    var messagesPerStore = {};
-    _.each(self.pending_data, function (msg) {
-      if (msg.collection && msg.id && self.stores[msg.collection]) {
-        if (_.has(messagesPerStore, msg.collection))
-          ++messagesPerStore[msg.collection];
-        else
-          messagesPerStore[msg.collection] = 1;
-      }
-    });
-
-    _.each(self.stores, function (s, name) {
-      s.beginUpdate(_.has(messagesPerStore, name) ? messagesPerStore[name] : 0);
-    });
-
-    _.each(self.pending_data, function (msg) {
-      // Reset message from reconnect. Blow away everything.
-      //
-      // XXX instead of reset message, we could have a flag, and pass
-      // that to beginUpdate. This would be more efficient since we don't
-      // have to restore a snapshot if we're just going to blow away the
-      // db.
-      if (msg === "reset") {
-        _.each(self.stores, function (s) { s.reset(); });
+    // XXX explain and refactor the "at reconnect full quiescence"
+    if (self._bufferedMessagesAtReconnect) {
+      self._bufferedMessagesAtReconnect.push(msg);
+      _.each(msg.subs || [], function (subId) {
+        delete self.unready_subscriptions[subId];
+      });
+      _.each(msg.methods || [], function (methodId) {
+        delete self.unsatisfied_methods[methodId];
+      });
+      if (! _.isEmpty(self.unready_subscriptions))
         return;
-      }
+      if (! _.isEmpty(self.unsatisfied_methods))
+        return;
 
-      if (msg.collection && msg.id) {
-        var store = self.stores[msg.collection];
+      // All subscriptions that were ready before reconnect are now ready again!
+      // We'll now process and all of our buffered messages, reset all stores,
+      // and apply them all at once.
+      resetStores = true;
+      _.each(self._bufferedMessagesAtReconnect, function (bufferedMsg) {
+        self._processOneDataMessage(bufferedMsg, updates);
+      });
+      self._bufferedMessagesAtReconnect = null;
+    } else {
+      if (! _.isEmpty(self.unready_subscriptions))
+        throw new Error(
+          "unready_subscriptions not empty, _bufferedMessagesAtReconnect null");
+      self._processOneDataMessage(msg, updates);
+    }
 
-        if (!store) {
-          // Nobody's listening for this data. Queue it up until
-          // someone wants it.
-          // XXX memory use will grow without bound if you forget to
-          // create a collection.. going to have to do something about
-          // that.
-          if (!(msg.collection in self.queued))
-            self.queued[msg.collection] = [];
-          self.queued[msg.collection].push(msg);
-          return;
-        }
+    // Begin a transactional update of each store.
+    _.each(self.stores, function (s, storeName) {
+      s.beginUpdate(_.has(updates, storeName) ? updates[storeName].length : 0,
+                   resetStores);
+    });
 
-        store.update(msg);
-      }
-
-      if (msg.subs) {
-        _.each(msg.subs, function (id) {
-          var arr = self.sub_ready_callbacks[id];
-          if (arr) _.each(arr, function (c) { c(); });
-          delete self.sub_ready_callbacks[id];
+    _.each(updates, function (updateMessages, storeName) {
+      var store = self.stores[storeName];
+      if (store) {
+        _.each(updateMessages, function (updateMessage) {
+          store.update(updateMessage);
         });
+      } else {
+        // Nobody's listening for this data. Queue it up until
+        // someone wants it.
+        // XXX memory use will grow without bound if you forget to
+        // create a collection.. going to have to do something about
+        // that.
+        if (!_.has(self._updatesForUnknownStores, storeName))
+          self._updatesForUnknownStores[storeName] = [];
+        Array.prototype.push.apply(self._updatesForUnknownStores[storeName],
+                                   updateMessages);
       }
     });
 
+    // End update transaction.
     _.each(self.stores, function (s) { s.endUpdate(); });
 
-    _.each(self.quiesce_callbacks, function (cb) { cb(); });
-    self.quiesce_callbacks = [];
+    // Now that we've flushed all relevant docs, call sub-ready callbacks.
+    _.each(self._readySubs, function (subId) {
+      _.each(self.sub_ready_callbacks[subId], function (c) { c(); });
+      delete self.sub_ready_callbacks[subId];
+    });
+    self._readySubs = [];
 
-    self.pending_data = [];
+    // XXX remove this once tests don't need it
+    if (_.isEmpty(self.unsatisfied_methods)) {
+      _.each(self.quiesce_callbacks, function (cb) { cb(); });
+      self.quiesce_callbacks = [];
+    }
+  },
+
+  _processOneDataMessage: function (msg, updates) {
+    var self = this;
+    // Apply writes (set/unset) from the message.
+    if (msg.collection && msg.id) {
+      var serverDoc = Meteor._get(
+        self._serverDocuments, msg.collection, msg.id);
+      if (serverDoc) {
+        // A client stub wrote this document, so we have to apply this change to
+        // the snapshot in serverDoc rather than directly to the database.
+        // First apply unset (assuming that there are any fields at all.
+        if (serverDoc.document) {
+          _.each(msg.unset, function (propname) {
+            delete serverDoc.document[propname];
+          });
+        }
+        // Now apply set.
+        _.each(msg.set, function (value, propname) {
+          if (!serverDoc.document)
+            serverDoc.document = {};
+          serverDoc.document[propname] = value;
+        });
+        // Now erase the document if it has become empty.
+        if (serverDoc.document &&
+            _.isEmpty(_.without(_.keys(serverDoc.document), '_id')))
+          delete serverDoc.document;
+      } else {
+        // No client stub wrote this document, so we can apply it
+        // directly to the database.
+        if (!updates[msg.collection])
+          updates[msg.collection] = [];
+        updates[msg.collection].push(msg);
+      }
+    }
+
+    // Process "method done" messages.
+    _.each(msg.methods, function (methodId) {
+      // XXX remove once tests don't need onQuiesce
+      delete self.unsatisfied_methods[methodId];
+
+      _.each(self._documentsWrittenByStub[methodId], function (written) {
+        var serverDoc = Meteor._get(self._serverDocuments,
+                                    written.collection, written.id);
+        if (!serverDoc)
+          throw new Error("Lost serverDoc for " + JSON.stringify(written));
+        if (!serverDoc.writtenByStubs[methodId])
+          throw new Error("Doc " + JSON.stringify(written) +
+                          " not written by  method " + methodId);
+        delete serverDoc.writtenByStubs[methodId];
+        if (_.isEmpty(serverDoc.writtenByStubs)) {
+          // All methods whose stubs wrote this method have completed! We can
+          // now copy the saved document to the database (reverting the stub's
+          // change if the server did not write to this object, or applying the
+          // server's writes if it did).
+          if (!updates[written.collection])
+            updates[written.collection] = [];
+          updates[written.collection].push({id: written.id,
+                                            replace: serverDoc.document});
+          // Call all flush callbacks.
+          _.each(serverDoc.flushCallbacks, function (c) {
+            c();
+          });
+
+          // Delete this completed serverDocument. Don't bother to GC empty
+          // objects inside self._serverDocuments, since there probably aren't
+          // many collections and they'll be written repeatedly.
+          delete self._serverDocuments[written.collection][written.id];
+        }
+      });
+      delete self._documentsWrittenByStub[methodId];
+    });
+
+    // Process "sub ready" messages. "sub ready" messages don't take effect
+    // until all current server documents have been flushed to the local
+    // database. We can use a write fence to implement this.
+    _.each(msg.subs, function (subId) {
+      var fence = new Meteor._WriteFence;
+      _.each(self._serverDocuments, function (collectionDocs) {
+        _.each(collectionDocs, function (serverDoc) {
+          serverDoc.flushCallbacks.push(fence.beginWrite().committed);
+        });
+      });
+      fence.onAllCommitted(function () {
+        // Once all currently buffered documents have been flushed to the local
+        // database, mark this sub as ready; we'll call its callbacks after
+        // actually processing 'updates'.
+        self._readySubs.push(subId);
+      });
+      fence.arm();
+    });
   },
 
   _livedata_nosub: function (msg) {
@@ -835,3 +998,4 @@ Meteor._LivedataConnection._allSubscriptionsReady = function () {
     return true;
   });
 };
+})();

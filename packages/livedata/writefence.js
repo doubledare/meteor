@@ -62,6 +62,7 @@ _.extend(Meteor._WriteFence.prototype, {
   },
 
   // Convenience function. Arms the fence, then blocks until it fires.
+  // Only can be called on the server.
   armAndWait: function () {
     var self = this;
     var future = new Future;

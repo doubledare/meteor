@@ -46,8 +46,6 @@ Meteor._runTestsEverywhere = function (onReport, onComplete) {
         report.server = true;
         onReport(report);
       });
-    },
-    beginUpdate: function () {},
-    endUpdate: function () {},
-    reset: function () {}});
+    }
+  });
 };
