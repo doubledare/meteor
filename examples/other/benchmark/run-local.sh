@@ -41,9 +41,13 @@ for ((i = 0 ; i < $DURATION/$REPORT_INTERVAL ; i++)) ; do
     ps -o cputime,ppid,args | grep "$OUTER_PID" | grep main.js || true
 done
 
+echo
+echo TOTALS
+ps -o cputime,pid,ppid,args | grep "$OUTER_PID" | grep -v grep|| true
+
 kill -INT $OUTER_PID
 # XXX kill by pid
-killall phantomjs
+killall -INT phantomjs
 
 rm "$PHANTOMSCRIPT"
 

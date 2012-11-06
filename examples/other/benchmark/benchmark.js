@@ -1,43 +1,14 @@
-//////////////////////////////
-// Parameters for the test
-//////////////////////////////
+// Pick which scenario we run. Pass the 'SCENARIO' environment variable
+// to change this. See 'benchmark-scenarios.js' for the list of
+// scenarios.
 
-// XXX pick different scenarios, have configurable?
-
-var PARAMS = {
-  numBuckets: 10,
-  numCollections: 1,
-
-  // initial document population.
-  // probably not usefully combined w/ maxAge?
-  initialDocuments: 1,
-
-  // How many inserts should each client do per second.
-  insertRate: 1,
-  // How many updates should each client do per second.
-  updateRate: 1,
-  // How many removes should each client do per second.  This should be
-  // less than or equal to the insert rate, otherwise the simulation
-  // will stablize on 0 documents.
-  removeRate: 0.1,
-
-  // How long to leave documents in the database. This, combined with
-  // all the various rates, determines the steady state database
-  // size. In seconds. falsy to disable.
-  maxAge: 60,
-
-  // XXX also max documents?
-  // count and remove N?
-
-  // Document size.
-  // XXX make this a random distribution?
-  //
-  // bytes of randomness per document.
-  documentSize: 1024,
-  // how many fields of randomness per document.
-  documentNumFields: 8
-};
-
+if (Meteor.isServer) {
+  if (process.env.SCENARIO)
+    __meteor_runtime_config__.SCENARIO = process.env.SCENARIO;
+  else
+    __meteor_runtime_config__.SCENARIO = 'default';
+}
+var PARAMS = SCENARIOS[__meteor_runtime_config__.SCENARIO];
 
 
 //////////////////////////////
