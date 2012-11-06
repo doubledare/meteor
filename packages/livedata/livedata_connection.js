@@ -72,8 +72,8 @@ Meteor._LivedataConnection = function (url, options) {
 
   // XXX doc and better name
   self._bufferedMessagesAtReconnect = null;
-  // XXX doc and better name
-  self._readySubs = [];
+  // XXX doc
+  self._afterUpdateCallbacks = [];
 
   // method ID -> array of collection/id pairs, listing documents written by a
   // given method's stub.
@@ -85,6 +85,9 @@ Meteor._LivedataConnection = function (url, options) {
   // - "writtenByStubs": a set of method IDs whose stubs wrote to the document
   //   whose "data done" messages have not yet been processed
   self._serverDocuments = {};
+  // XXX doc
+  // method ID -> callback
+  self._dataWrittenCallbacks = {};
 
   // metadata for subscriptions
   self.subs = new LocalCollection;
@@ -169,6 +172,11 @@ Meteor._LivedataConnection = function (url, options) {
     // `onReconnect` get executed _before_ ones that were originally
     // outstanding (since `onReconnect` is used to re-establish auth
     // certificates)
+
+    // XXX think about relationship between this and the new data structures.
+    // specifically, this will re-send those who haven't had 'result' calls, but
+    // they may or maybe not have had 'data' calls. so this could lead to double
+    // calls of data.
     if (self.onReconnect)
       self._callOnReconnectAndSendAppropriateOutstandingMethods();
     else
@@ -209,6 +217,31 @@ Meteor._LivedataConnection = function (url, options) {
       self.stream.send(JSON.stringify({msg: 'unsub', id: obj._id}));
     }
   });
+};
+
+// Given a callback, returns an object with two callbacks. One is called when
+// the method's result message comes in; one is called when the method's data is
+// done being written to the local database. The user's callback will be called
+// with the method result once both callbacks have been invoked.
+var waitForResultAndData = function (userCallback) {
+  var methodResult = null;
+  var dataVisible = false;
+
+  var maybeCallUserCallback = function () {
+    if (methodResult && dataVisible)
+      userCallback(methodResult[0], methodResult[1]);
+  };
+
+  return {
+    resultCallback: function (err, result) {
+      methodResult = [err, result];
+      maybeCallUserCallback();
+    },
+    dataWrittenCallback: function () {
+      dataVisible = true;
+      maybeCallUserCallback();
+    }
+  };
 };
 
 _.extend(Meteor._LivedataConnection.prototype, {
@@ -441,16 +474,19 @@ _.extend(Meteor._LivedataConnection.prototype, {
       id: methodId()
     };
 
+    var callUserCallback = waitForResultAndData(callback);
+    self._dataWrittenCallbacks[msg.id] = callUserCallback.dataWrittenCallback;
+
     if (self.outstanding_wait_method) {
       self.blocked_methods.push({
         msg: msg,
-        callback: callback,
+        callback: callUserCallback.resultCallback,
         wait: options.wait
       });
     } else {
       var method_object = {
         msg: msg,
-        callback: callback
+        callback: callUserCallback.resultCallback
       };
 
       if (options.wait)
@@ -664,12 +700,12 @@ _.extend(Meteor._LivedataConnection.prototype, {
     // End update transaction.
     _.each(self.stores, function (s) { s.endUpdate(); });
 
-    // Now that we've flushed all relevant docs, call sub-ready callbacks.
-    _.each(self._readySubs, function (subId) {
-      _.each(self.sub_ready_callbacks[subId], function (c) { c(); });
-      delete self.sub_ready_callbacks[subId];
+    // Call any callbacks deferred with _runWhenAllServerDocsAreFlushed whose
+    // relevant docs have been flushed.
+    _.each(self._afterUpdateCallbacks, function (c) {
+      c();
     });
-    self._readySubs = [];
+    self._afterUpdateCallbacks = [];
 
     // XXX remove this once tests don't need it
     if (_.isEmpty(self.unsatisfied_methods)) {
@@ -747,26 +783,39 @@ _.extend(Meteor._LivedataConnection.prototype, {
         }
       });
       delete self._documentsWrittenByStub[methodId];
+
+      // We want to call the data-written callback, but we can't do so until all
+      // currently buffered messages are flushed.
+      var dataWrittenCallback = self._dataWrittenCallbacks[methodId];
+      if (!dataWrittenCallback)
+        throw new Error("No data written callback for method " + methodId);
+      delete self._dataWrittenCallbacks[methodId];
+      self._runWhenAllServerDocsAreFlushed(dataWrittenCallback);
     });
 
     // Process "sub ready" messages. "sub ready" messages don't take effect
     // until all current server documents have been flushed to the local
     // database. We can use a write fence to implement this.
     _.each(msg.subs, function (subId) {
-      var fence = new Meteor._WriteFence;
-      _.each(self._serverDocuments, function (collectionDocs) {
-        _.each(collectionDocs, function (serverDoc) {
-          serverDoc.flushCallbacks.push(fence.beginWrite().committed);
-        });
+      self._runWhenAllServerDocsAreFlushed(function () {
+        _.each(self.sub_ready_callbacks[subId], function (c) { c(); });
+        delete self.sub_ready_callbacks[subId];
       });
-      fence.onAllCommitted(function () {
-        // Once all currently buffered documents have been flushed to the local
-        // database, mark this sub as ready; we'll call its callbacks after
-        // actually processing 'updates'.
-        self._readySubs.push(subId);
-      });
-      fence.arm();
     });
+  },
+
+  _runWhenAllServerDocsAreFlushed: function (f) {
+    var self = this;
+    var fence = new Meteor._WriteFence;
+    _.each(self._serverDocuments, function (collectionDocs) {
+      _.each(collectionDocs, function (serverDoc) {
+        serverDoc.flushCallbacks.push(fence.beginWrite().committed);
+      });
+    });
+    fence.onAllCommitted(function () {
+      self._afterUpdateCallbacks.push(f);
+    });
+    fence.arm();
   },
 
   _livedata_nosub: function (msg) {
